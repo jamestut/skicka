@@ -60,6 +60,7 @@ func ls(args []string) int {
 	longlong := false
 	recursive := false
 	dirAsFile := false
+    special := true
 	var argFilenames []string
 	for _, arg := range args {
 		if len(argFilenames) > 0 {
@@ -71,12 +72,14 @@ func ls(args []string) int {
 			long = true
 		} else if arg == "-ll" {
 			longlong = true
+        } else if arg == "-s" {
+            special = true
 		} else if arg == "-r" {
 			recursive = true
 		} else if arg == "-d" {
 			dirAsFile = true
 		} else if len(arg) > 0 && arg[0] == '-' {
-			fmt.Printf("Usage: skicka ls [-d,-l,-ll,-r] [drive_path ...]\n")
+			fmt.Printf("Usage: skicka ls [-d,-l,-ll,-r,-s] [drive_path ...]\n")
 			fmt.Printf("Run \"skicka help\" for more detailed help text.\n")
 			return 1
 		} else {
@@ -109,7 +112,7 @@ func ls(args []string) int {
 			// command line or gave the -d option, then don't try to list
 			// the directory contents.
 			for _, f := range files {
-				lsFile(f, recursive, long, longlong)
+				lsFile(f, recursive, long, longlong, special)
 			}
 		} else {
 			// Otherwise get either the files in the enclosing folder, or
@@ -131,7 +134,7 @@ func ls(args []string) int {
 			}
 
 			for _, f := range files {
-				lsFile(f, recursive, long, longlong)
+				lsFile(f, recursive, long, longlong, special)
 			}
 
 			if len(argFilenames) > 1 && index < len(argFilenames)-1 {
@@ -143,23 +146,32 @@ func ls(args []string) int {
 }
 
 // Produce listing output to stdout for a single file.
-func lsFile(f *gdrive.File, recursive, long, longlong bool) {
+func lsFile(f *gdrive.File, recursive, long, longlong, special bool) {
 	printFilename := f.Path
 	if !recursive {
 		printFilename = filepath.Base(printFilename)
 	}
-	if f.IsFolder() {
-		printFilename += string(os.PathSeparator)
-	}
 
 	if !long && !longlong {
+        if f.IsFolder() {
+            printFilename += string(os.PathSeparator)
+        }
+    
 		fmt.Printf("%s\n", printFilename)
 		return
 	}
 
 	synctime := f.ModTime.Local()
 	permString, _ := getPermissionsAsString(f)
-	if longlong {
+    if special {
+        md5 := f.Md5
+		if len(md5) != 32 {
+			md5 = "--------------------------------"
+		}
+		fmt.Printf("%s  %d  %s  %s  %s\n", permString,
+			f.FileSize, md5, synctime.Format(time.RFC3339),
+			printFilename)
+    } else if longlong {
 		md5 := f.Md5
 		if len(md5) != 32 {
 			md5 = "--------------------------------"

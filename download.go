@@ -20,12 +20,11 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/aes"
 	"encoding/hex"
 	"fmt"
-	"github.com/cheggaaa/pb"
-	"github.com/google/skicka/gdrive"
 	"io"
 	"os"
 	"path"
@@ -33,11 +32,16 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/cheggaaa/pb"
+	"github.com/google/skicka/gdrive"
 )
 
 func downloadUsage() {
 	fmt.Printf("Usage: skicka download [-ignore-times] [-dry-run] [-download-google-apps-files]\n")
 	fmt.Printf("       drive_path local_path\n")
+	fmt.Printf("Usage: skicka download -use-file-list [-ignore-times] [-dry-run]\n")
+	fmt.Printf("       file_list local_path\n")
 	fmt.Printf("Run \"skicka help\" for more detailed help text.\n")
 }
 
@@ -46,9 +50,12 @@ func download(args []string) int {
 	ignoreTimes := false
 	downloadGoogleAppsFiles := false
 	dryRun := false
+	useFileList := false
 	for i := 0; i < len(args); i++ {
 		if args[i] == "-ignore-times" {
 			ignoreTimes = true
+		} else if args[i] == "-use-file-list" {
+			useFileList = true
 		} else if args[i] == "-download-google-apps-files" {
 			downloadGoogleAppsFiles = true
 		} else if args[i] == "-dry-run" {
@@ -69,39 +76,43 @@ func download(args []string) int {
 	}
 	trustTimes := !ignoreTimes
 
-	// Start out by seeing what we've got at the given path in Drive. If
-	// it's not a single file or folder, then error out.
-	files := gd.GetFiles(drivePath)
-	if len(files) == 0 {
-		printErrorAndExit(fmt.Errorf("%s: not found on Drive", drivePath))
-	} else if len(files) > 1 {
-		printErrorAndExit(fmt.Errorf("%s: %d files found on Drive with this name",
-			drivePath, len(files)))
-	}
-
-	syncStartTime = time.Now()
-
 	var errs int
-	if files[0].IsFolder() {
-		// Download a folder from Drive to the local system.
-		errs = syncHierarchyDown(drivePath, localPath, trustTimes,
-			downloadGoogleAppsFiles, dryRun)
+	if useFileList {
+		errs = syncDownloadList(drivePath, localPath, trustTimes, false, dryRun)
 	} else {
-		// Only download a single file.
-		stat, err := os.Stat(localPath)
-		if err == nil && stat.IsDir() {
-			// drivePath is a single file but localPath is a directory, so
-			// append the base name of the drive file to the local path.
-			localPath = path.Join(localPath, filepath.Base(drivePath))
+		// Start out by seeing what we've got at the given path in Drive. If
+		// it's not a single file or folder, then error out.
+		files := gd.GetFiles(drivePath)
+		if len(files) == 0 {
+			printErrorAndExit(fmt.Errorf("%s: not found on Drive", drivePath))
+		} else if len(files) > 1 {
+			printErrorAndExit(fmt.Errorf("%s: %d files found on Drive with this name",
+				drivePath, len(files)))
 		}
 
-		if !downloadGoogleAppsFiles && files[0].IsGoogleAppsFile() {
-			message("%s: skipping Google Apps file.", files[0].Path)
+		syncStartTime = time.Now()
+
+		if files[0].IsFolder() {
+			// Download a folder from Drive to the local system.
+			errs = syncHierarchyDown(drivePath, localPath, trustTimes,
+				downloadGoogleAppsFiles, dryRun)
 		} else {
-			err = syncOneFileDown(files[0], localPath, trustTimes, dryRun)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "skicka: %s: %s\n", drivePath, err)
-				errs++
+			// Only download a single file.
+			stat, err := os.Stat(localPath)
+			if err == nil && stat.IsDir() {
+				// drivePath is a single file but localPath is a directory, so
+				// append the base name of the drive file to the local path.
+				localPath = path.Join(localPath, filepath.Base(drivePath))
+			}
+
+			if !downloadGoogleAppsFiles && files[0].IsGoogleAppsFile() {
+				message("%s: skipping Google Apps file.", files[0].Path)
+			} else {
+				err = syncOneFileDown(files[0], localPath, trustTimes, dryRun)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "skicka: %s: %s\n", drivePath, err)
+					errs++
+				}
 			}
 		}
 	}
@@ -224,6 +235,168 @@ func syncHierarchyDown(driveBasePath string, localBasePath string, trustTimes bo
 	nBytesToDownload := int64(0)
 	var filesToDownload []*gdrive.File
 	for _, f := range uniqueDriveFiles {
+		if f.IsFolder() {
+			// Folders were aready taken care of by createLocalDirectories().
+			continue
+		}
+
+		localPath := localPathMap[f.Path]
+		needsDownload, err := fileNeedsDownload(localPath, f, trustTimes)
+		if err != nil {
+			addErrorAndPrintMessage(&nDownloadErrors,
+				fmt.Sprintf("%s: error determining if file needs download\n",
+					f.Path), err)
+			continue
+		}
+
+		if needsDownload {
+			nBytesToDownload += f.FileSize
+			filesToDownload = append(filesToDownload, f)
+		} else {
+			// No download needed, but make sure the local permissions and
+			// modified time match those values on Drive.
+			syncLocalFileMetadata(localPath, f, &nDownloadErrors)
+		}
+	}
+
+	// Bail out early if everything is up to date.
+	if len(filesToDownload) == 0 {
+		message("Nothing to download.")
+		return 0
+	}
+
+	// Actually download the files. We'll use multiple workers to improve
+	// performance; we're more likely to have some workers actively
+	// downloading file contents while others are still making Drive API
+	// calls this way.
+	toDownloadChan := make(chan *gdrive.File, 128)
+	doneChan := make(chan int, nWorkers)
+	progressBar := getProgressBar(nBytesToDownload)
+
+	// Launch the workers.
+	for i := 0; i < nWorkers; i++ {
+		go func() {
+			for {
+				// Get the gdrive.File for the file the worker should download
+				// next.
+				if f, ok := <-toDownloadChan; ok {
+					localPath := localPathMap[f.Path]
+					err := downloadFile(f, localPath, progressBar)
+					if err != nil {
+						addErrorAndPrintMessage(&nDownloadErrors, localPath, err)
+					}
+				} else {
+					debug.Printf("Worker exiting")
+					doneChan <- 1
+					break
+				}
+			}
+		}()
+	}
+
+	// Send the workers the files to be downloaded.
+	for _, f := range filesToDownload {
+		toDownloadChan <- f
+	}
+	close(toDownloadChan)
+
+	// And now wait for the workers to all return.
+	for i := 0; i < nWorkers; i++ {
+		<-doneChan
+	}
+	if progressBar != nil {
+		progressBar.Finish()
+	}
+
+	if nDownloadErrors > 0 {
+		fmt.Fprintf(os.Stderr, "skicka: %d files not downloaded due to errors\n",
+			nDownloadErrors)
+	}
+	return int(nDownloadErrors)
+}
+
+func syncDownloadList(listPath string, localBasePath string, trustTimes bool,
+	downloadGoogleAppsFiles bool, dryRun bool) int {
+	// no support for downloadGAppsFiles
+	if downloadGoogleAppsFiles {
+		message("Google Apps file not supported")
+		return 0
+	}
+
+	// first, open file list
+	listFile, err := os.Open(listPath)
+	if err != nil {
+		printErrorAndExit(err)
+	}
+	defer listFile.Close()
+
+	// read file list line by line and convert it to GDrive objects
+	var files []*gdrive.File
+	scanner := bufio.NewScanner(listFile)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if len(line) == 0 {
+			continue
+		}
+		gfiles := gd.GetFiles(line)
+		// we don't support more than one version of file
+		if len(gfiles) > 1 {
+			printErrorAndExit(fmt.Errorf("%s: %d files found on Drive with this name",
+				line, len(files)))
+		} else if len(gfiles) == 0 {
+			printErrorAndExit(fmt.Errorf("%s: Object does not exists on Drive", line))
+		}
+		// make sure everything is file, not folder
+		if gfiles[0].IsFolder() {
+			printErrorAndExit(fmt.Errorf("%s: is a directory", line))
+		}
+		// ensure files is a regular file
+		if gfiles[0].IsGoogleAppsFile() {
+			printErrorAndExit(fmt.Errorf("%s: Google Apps file not supported", line))
+		}
+		// file name may not contain slash
+		if gfiles[0].PathHasSlash() {
+			printErrorAndExit(fmt.Errorf("%s: Illegal path name", line))
+		}
+		files = append(files, gfiles[0])
+	}
+	// ensure that the scanner is not error
+	if err := scanner.Err(); err != nil {
+		printErrorAndExit(err)
+	}
+
+	// Create a map that stores the local filename to use for each file in
+	// Google Drive. This map is indexed by the path of the Google Drive
+	// file.
+	localPathMap := make(map[string]string)
+	for _, f := range files {
+		localPathMap[f.Path] = path.Join(localBasePath, f.Path)
+	}
+
+	if dryRun {
+		var totalBytes int64
+		for _, f := range files {
+			fmt.Printf("%s -> %s (%d bytes)\n", f.Path, localPathMap[f.Path],
+				f.FileSize)
+			totalBytes += f.FileSize
+		}
+		fmt.Printf("Total bytes %d\n", totalBytes)
+		return 0
+	}
+
+	// First create all of the local directories, so that the downloaded
+	// files have somewhere to land.  Stop executing if there's an error;
+	// we almost certainly can't successfully go on if we failed creating
+	// some local direcotries.
+	err = createLocalDirectoriesFromLocalFile(localPathMap)
+	checkFatalError(err, "")
+
+	// Now figure out which files actually need to be downloaded and
+	// initialize filesToDownload with their corresponding gdrive.Files.
+	nBytesToDownload := int64(0)
+	nDownloadErrors := int32(0)
+	var filesToDownload []*gdrive.File
+	for _, f := range files {
 		if f.IsFolder() {
 			// Folders were aready taken care of by createLocalDirectories().
 			continue
@@ -441,6 +614,24 @@ func createLocalDirectories(localPathMap map[string]string, files []*gdrive.File
 		err = os.Chmod(dirPath, permissions)
 		if err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func createLocalDirectoriesFromLocalFile(localPathMap map[string]string) error {
+	for _, v := range localPathMap {
+		dirPath := path.Dir(v)
+		if stat, err := os.Stat(dirPath); err == nil {
+			// A file or directory already exists at dirPath.
+			if !stat.IsDir() {
+				return fmt.Errorf("%s: is a regular file but expected a folder", dirPath)
+			}
+		} else {
+			err = os.MkdirAll(dirPath, 0777)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil

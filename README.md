@@ -31,10 +31,14 @@ Furthermore, although skicka has been robust in usage so far and has
 no known data corruption bugs, it should for now be treated as "alpha"
 software.  Bug reports are welcome.
 
+### About this modification
+
+This branch contains several modification. Read [README_MOD.md](README_MOD.md) for more details.
+
 ## Getting Started
 
 1. You must have a [Go](http://golang.org) compiler installed.
-2. Download and build skicka: `go get github.com/google/skicka`
+2. Download and build skicka: `go get github.com/jamestut/skicka@personalmod`
 3. Either copy the `skicka` executable in `$GOPATH/bin` to a directory in
    your `PATH`, or add `$GOPATH/bin` to your `PATH`.
 4. Run `skicka init` to create a skeleton `~/.skicka.config` file. Various
